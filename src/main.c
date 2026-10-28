@@ -1,3 +1,4 @@
+
 /* Copyright (C) 2026, HvA
 ** All rights reserved.
 **
@@ -7,138 +8,143 @@
 ** Written by M.B. van der Linden, October 2026
 */
 
-
 #define F_CPU 32000000UL
+#define INT_DIV 16                              // Aantal timer-overflows per meetinterval
 
-#define ADC_SAMPLES 16
-#define ADC_Hysterese 20
+#define MINRES 3480                             // ADC-waarde bij 25 graden
+#define MAXRES 2470                             // ADC-waarde bij 40 graden
+#define MINTEMP 25.0f                           // Temperatuur bij MINRES
+#define MAXTEMP 40.0f                           // Temperatuur bij MAXRES
 
 #include <stdio.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
-#include <util/delay.h>
 
 #include "clock.h"
 #include "serialF0.h"
 #include "ucglib_xmega.h"
 
-// Interrupt flag for letting the main program know that
-// an interrupt has occurred.
-volatile uint8_t iflag = 0;
+// Variabelen voor de timerinterrupt
+volatile uint8_t iflag = 0;                             // Vlag voor het uitvoeren van een ADC-meting
+volatile uint8_t int_div = INT_DIV;                     // Teller voor het aantal timer-overflows
 
-// Variable used to slow down the interrupts. Only after
-// INT_DIV interrupts, will the flag be set.
-#define INT_DIV 16
-volatile uint8_t int_div = INT_DIV;
 
+/*
+ * Bron: Wim Dolman, De taal C en de Xmega,
+ * Hoofdstuk 20, code 20.1, pagina 338.
+ */
 void init_adc(void)
 {
-    PORTB.DIRCLR = PIN0_bm;                                                  // configure PA2 as input for ADCA
-    ADCB.CH0.MUXCTRL = ADC_CH_MUXPOS_PIN0_gc;                                // PA2 to channel 0
-    ADCB.CH0.CTRL = ADC_CH_INPUTMODE_SINGLEENDED_gc;                         // channel 0 single-ended
-    ADCB.REFCTRL = ADC_REFSEL_INTVCC_gc;                                     // internal VCC/1.6 reference
-    ADCB.CTRLB = ADC_RESOLUTION_12BIT_gc;                                    // 12 bits conversion, unsigned
-    ADCB.PRESCALER = ADC_PRESCALER_DIV16_gc;                                 // 2MHz/16 = 125kHz
-    ADCB.CTRLA = ADC_ENABLE_bm;                                              // enable adc
+    PORTB.DIRCLR = PIN1_bm;                             // Stel PB1 in als ingang voor ADCB
+    ADCB.CH0.MUXCTRL = ADC_CH_MUXPOS_PIN1_gc;           // Verbind PB1 met ADC-kanaal 0
+    ADCB.CH0.CTRL = ADC_CH_INPUTMODE_SINGLEENDED_gc;    // Stel kanaal 0 in op single-ended
+    ADCB.REFCTRL = ADC_REFSEL_INTVCC_gc;                // Gebruik VCC/1,6 als referentiespanning
+    ADCB.CTRLB = ADC_RESOLUTION_12BIT_gc;               // Stel de ADC in op 12-bit unsigned
+    ADCB.PRESCALER = ADC_PRESCALER_DIV256_gc;           // Stel de ADC-klok in op 32 MHz / 256 = 125 kHz
+    ADCB.CTRLA = ADC_ENABLE_bm;                         // Schakel ADCB in
 }
 
-uint16_t read_adc()
+
+/*
+ * Bron: Wim Dolman, De taal C en de Xmega,
+ * Hoofdstuk 20, code 20.1, pagina 338.
+ */
+uint16_t read_adc(void)
 {
-    uint16_t res = 0;
-    uint16_t previous = 0;
-    uint8_t i;
+    uint16_t res;                                       // Variabele voor het 12-bit ADC-resultaat
 
-    for (i = 0; i < ADC_SAMPLES; i = i + 1)
-    {
-        ADCB.CH0.CTRL |= ADC_CH_START_bm;                                   // start ADC conversion
-        while ( !(ADCB.CH0.INTFLAGS & ADC_CH_CHIF_bm) ) ;                   // wait until it's ready'
+    ADCB.CH0.CTRL |= ADC_CH_START_bm;                   // Start de ADC-conversie op kanaal 0
+    while (!(ADCB.CH0.INTFLAGS & ADC_CH_CHIF_bm));      // Wacht totdat de conversie voltooid is
 
-        res = res + ADCB.CH0.RES;
-        ADCB.CH0.INTFLAGS = ADC_CH_CHIF_bm;                                 // reset interrupt flag
-    }
+    res = ADCB.CH0.RES;                                 // Lees het ADC-resultaat uit
+    ADCB.CH0.INTFLAGS |= ADC_CH_CHIF_bm;                // Wis de interruptvlag van de ADC
 
-    res = res / ADC_SAMPLES;                                                // return average of samples
-
-    if (res > previous + ADC_Hysterese || res + ADC_Hysterese < previous)   //Hysterese
-    {
-        previous = res;
-    }
-
-    return previous;
+    return res;                                         // Geef de gemeten ADC-waarde terug
 }
 
 
-void ucg_init(ucg_t *ucg) {
-  ucg_com_fnptr ucg_xmega_func = &ucg_com_xmega_cb;
-  ucg_Init(ucg, ucg_dev_st7735_18x128x160, ucg_ext_st7735_18, ucg_xmega_func);
-
+// Initialiseer het grafische LCD
+void ucg_init(ucg_t *ucg)
+{
+    ucg_com_fnptr ucg_xmega_func = &ucg_com_xmega_cb;   // Selecteer de communicatiefunctie voor de Xmega
+    ucg_Init(ucg, ucg_dev_st7735_18x128x160,
+             ucg_ext_st7735_18, ucg_xmega_func);        // Initialiseer het ST7735-display
 }
 
 
+// Initialiseer timer TCE0
 void timer_init(void)
 {
-    TCE0.CTRLB = TC_WGMODE_NORMAL_gc;
-    TCE0.CTRLA = TC_CLKSEL_DIV1_gc;
-    TCE0.INTCTRLA = TC_OVFINTLVL_LO_gc;
-    TCE0.PER = 31999;
+    TCE0.CTRLB = TC_WGMODE_NORMAL_gc;                   // Stel de timer in op normale telmodus
+    TCE0.CTRLA = TC_CLKSEL_DIV1_gc;                     // Gebruik de systeemklok zonder prescaler
+    TCE0.INTCTRLA = TC_OVFINTLVL_LO_gc;                 // Schakel overflow-interrupt op laag niveau in
+    TCE0.PER = 31999;                                   // Genereer iedere 1 ms een timer-overflow
 }
 
 
 int main(void)
 {
-    init_clock();
-    timer_init();
-    init_stream(F_CPU);
+    // Initialiseer de microcontroller
+    init_clock();                                       // Stel de systeemklok in op 32 MHz
+    timer_init();                                       // Initialiseer timer TCE0
+    init_stream(F_CPU);                                 // Initialiseer de seriële communicatie
 
-    // Set pin D0 (external LED) to output
-    PORTD.DIRSET = PIN0_bm;
-    // Turn off external LED
-    PORTD.OUTCLR = PIN0_bm;
+    // Initialiseer de externe LED
+    PORTD.DIRSET = PIN0_bm;                             // Stel PD0 in als uitgang
+    PORTD.OUTCLR = PIN0_bm;                             // Schakel de externe LED uit
 
-    // Enable interrupts globally
-    sei();
+    sei();                                              // Schakel globale interrupts in
 
-    // Initialize the data structure of the UCG library and
-    // draw some stuff on the display
+    // Initialiseer het grafische LCD
     ucg_t ucg;
-    ucg_init(&ucg);
-    ucg_SetFontMode(&ucg, UCG_FONT_MODE_TRANSPARENT);
-    ucg_ClearScreen(&ucg);
-    ucg_SetFont(&ucg, ucg_font_8x13_mr);
-    ucg_SetColor(&ucg, 0, 255, 255, 0);
-    ucg_SetRotate180(&ucg);
-    ucg_SetColor(&ucg, 0, 255, 180, 180);
-    ucg_DrawString(&ucg, 0, 50, 0, "OUT");
-    ucg_DrawLine(&ucg, 20, 50, 140, 50);
-    
-    uint16_t res;
-    init_adc();
+    ucg_init(&ucg);                                     // Initialiseer het display
+    ucg_SetFontMode(&ucg, UCG_FONT_MODE_TRANSPARENT);   // Stel een transparante tekstachtergrond in
+    ucg_ClearScreen(&ucg);                              // Wis het scherm
+    ucg_SetFont(&ucg, ucg_font_8x13_mr);                // Selecteer het lettertype
+    ucg_SetColor(&ucg, 0, 255, 255, 0);                 // Stel kleurindex 0 in op geel
+    ucg_SetRotate180(&ucg);                             // Draai de schermoriëntatie 180 graden
+    // ucg_SetColor(&ucg, 0, 255, 180, 180);               // Stel kleurindex 0 in op lichtroze
+    // ucg_DrawString(&ucg, 0, 50, 0, "OUT");              // Schrijf de tekst OUT op het scherm
+    // ucg_DrawLine(&ucg, 20, 50, 140, 50);                // Teken een horizontale lijn
 
-    while (1) 
+    // Initialiseer de ADC
+    uint16_t res;                                       // Variabele voor de gemeten ADC-waarde
+    init_adc();                                         // Initialiseer ADCB
+
+    while (1)
     {
-
-
-        if (iflag) 
+        if (iflag)                                      // Controleer of een nieuwe meting nodig is
         {
-            iflag = 0;
+            iflag = 0;                                  // Wis de meetvlag
+
             res = read_adc();
-            char buffer[5];
-            sprintf(buffer, "%4u", res);
+
+            float OUT = MINTEMP + (((MAXTEMP - MINTEMP) / (MAXRES - MINRES)) * ((float)res - MINRES));
+
+            char buffer[20];
+
             ucg_SetFontMode(&ucg, UCG_FONT_MODE_SOLID);
-            ucg_SetColor(&ucg, 1, 0, 0, 0);
-            ucg_DrawString(&ucg, 0, 50, 0, buffer);
+            ucg_SetColor(&ucg, 0, 255, 255, 255);       // Tekstkleur wit
+            ucg_SetColor(&ucg, 1, 0, 0, 0);             // Achtergrondkleur zwart
+
+            sprintf(buffer, "ADC = %u", res);
+            ucg_DrawString(&ucg, 0, 60, 0, buffer);     // Toon ADC-waarde
+
+            sprintf(buffer, "Temp = %d C", (int)OUT);
+            ucg_DrawString(&ucg, 0, 80, 0, buffer);     // Toon temperatuur
         }
     }
 }
 
+
+// Interrupt Service Routine voor timer TCE0
 ISR(TCE0_OVF_vect)
 {
-    // Interrupt has occurred, decrease the interrupt divider
-    int_div--;
+    int_div--;                                          // Verlaag de interruptteller
 
-    if (int_div == 0) {
-        iflag = 1;
-        // Reset the interrupt divider for the next interrupts
-        int_div = INT_DIV;
+    if (int_div == 0)                                   // Controleer of het meetinterval verstreken is
+    {
+        iflag = 1;                                      // Geef aan dat een ADC-meting nodig is
+        int_div = INT_DIV;                              // Herstart de interruptteller
     }
 }
