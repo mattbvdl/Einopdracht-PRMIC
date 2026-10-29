@@ -9,12 +9,16 @@
 */
 
 #define F_CPU 32000000UL
-#define INT_DIV 16                              // Aantal timer-overflows per meetinterval
+#define INT_DIV 16                                      // Aantal timer-overflows per meetinterval
 
-#define MINRES 3480                             // ADC-waarde bij 25 graden
-#define MAXRES 2470                             // ADC-waarde bij 40 graden
-#define MINTEMP 25.0f                           // Temperatuur bij MINRES
-#define MAXTEMP 40.0f                           // Temperatuur bij MAXRES
+#define MINRES 3569                                     // ADC-waarde bij 22,9 graden
+#define MAXRES 2760                                     // ADC-waarde bij 40 graden
+#define MINTEMP 22.9f                                   // Gemeten temperatuur
+#define MAXTEMP 40.0f                                   // Gemeten temperatuur
+
+#define FAN_ON_TEMP 30.0f                               // Ventilator AAN vanaf 30 graden
+#define FAN_OFF_TEMP 25.0f                              // Ventilator UIT bij 25 graden
+#define PWM_MAX 16000                                   // PWM 100%
 
 #include <stdio.h>
 #include <avr/io.h>
@@ -81,19 +85,40 @@ void timer_init(void)
     TCE0.PER = 31999;                                   // Genereer iedere 1 ms een timer-overflow
 }
 
+/*
+ * Bron: Wim Dolman, De taal C en de Xmega,
+ * Hoofdstuk 22, code 22.3 en 22.4, pagina 392-393.
+ * Aangepast voor PWM op D1 (PD1) bij 32 MHz.
+ */
+void pwm_init(void)
+{
+    TCD0.CTRLB = TC0_CCBEN_bm | TC_WGMODE_SINGLESLOPE_gc; // Activeer PWM op PD1 in single-slope-modus
+    TCD0.PER = 31999;                                    // Stel de PWM-frequentie in op 1 kHz
+    TCD0.CCB = 0;                                    // Stel de PWM-dutycycle aanvankelijk in op 50%
+    TCD0.CTRLA = TC_CLKSEL_DIV1_gc;                      // Gebruik de systeemklok van 32 MHz zonder prescaler
+}
+
 
 int main(void)
 {
     // Initialiseer de microcontroller
-    init_clock();                                       // Stel de systeemklok in op 32 MHz
-    timer_init();                                       // Initialiseer timer TCE0
-    init_stream(F_CPU);                                 // Initialiseer de seriële communicatie
+    init_clock();
+    init_stream(F_CPU);
 
     // Initialiseer de externe LED
-    PORTD.DIRSET = PIN0_bm;                             // Stel PD0 in als uitgang
-    PORTD.OUTCLR = PIN0_bm;                             // Schakel de externe LED uit
+    PORTD.OUTCLR = PIN0_bm;
+    PORTD.DIRSET = PIN0_bm;
 
+    // Initialiseer de PWM-uitgang
+    PORTD.OUTCLR = PIN1_bm;                             // Zet D1 (PD1) laag
+    PORTD.DIRSET = PIN1_bm;                             // Stel D1 in als uitgang
+
+    timer_init();                                       // Initialiseer TCE0 voor de overflow-interrupt
+    pwm_init();                                         // Initialiseer TCD0 voor PWM
+
+    PMIC.CTRL |= PMIC_LOLVLEN_bm;                       // Schakel low-level interrupts in
     sei();                                              // Schakel globale interrupts in
+
 
     // Initialiseer het grafische LCD
     ucg_t ucg;
@@ -103,9 +128,6 @@ int main(void)
     ucg_SetFont(&ucg, ucg_font_8x13_mr);                // Selecteer het lettertype
     ucg_SetColor(&ucg, 0, 255, 255, 0);                 // Stel kleurindex 0 in op geel
     ucg_SetRotate180(&ucg);                             // Draai de schermoriëntatie 180 graden
-    // ucg_SetColor(&ucg, 0, 255, 180, 180);               // Stel kleurindex 0 in op lichtroze
-    // ucg_DrawString(&ucg, 0, 50, 0, "OUT");              // Schrijf de tekst OUT op het scherm
-    // ucg_DrawLine(&ucg, 20, 50, 140, 50);                // Teken een horizontale lijn
 
     // Initialiseer de ADC
     uint16_t res;                                       // Variabele voor de gemeten ADC-waarde
@@ -130,8 +152,19 @@ int main(void)
             sprintf(buffer, "ADC = %u", res);
             ucg_DrawString(&ucg, 0, 60, 0, buffer);     // Toon ADC-waarde
 
-            sprintf(buffer, "Temp = %d C", (int)OUT);
+            int temp10 = (int)(OUT * 10.0f + 0.5f);
+            sprintf(buffer, "Temp = %d,%01d C", temp10 / 10, temp10 % 10);
             ucg_DrawString(&ucg, 0, 80, 0, buffer);     // Toon temperatuur
+
+            // Ventilatorregeling met hysterese
+            if (OUT >= FAN_ON_TEMP)
+            {
+                TCD0.CCBBUF = PWM_MAX;                 // Ventilator AAN bij 30 graden
+            }
+            else if (OUT <= FAN_OFF_TEMP)
+            {
+                TCD0.CCBBUF = 0;                       // Ventilator UIT bij 25 graden
+            }
         }
     }
 }
